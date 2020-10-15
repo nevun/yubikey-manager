@@ -25,19 +25,23 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import absolute_import, print_function
+from yubikit.core import USB_INTERFACE, ApplicationNotAvailableError
+from yubikit.core.fido import FidoConnection
+from yubikit.core.smartcard import SmartCardConnection
 
 import ykman.logging_setup
-import smartcard.pcsc.PCSCExceptions
 
-from ykman import __version__
-from ..util import TRANSPORT, Cve201715361VulnerableError, YUBIKEY
-from ..native.pyusb import get_usb_backend_version
-from ..driver_otp import libversion as ykpers_version
-from ..driver_ccid import open_devices as open_ccid, list_readers
-from ..device import YubiKey
-from ..descriptor import (get_descriptors, list_devices, open_device,
-                          FailedOpeningDeviceException, Descriptor)
+from .. import __version__
+from ..scard import list_devices as list_ccid, list_readers
+from ..util import Cve201715361VulnerableError
+from ..device import (
+    read_info,
+    get_name,
+    list_all_devices,
+    scan_devices,
+    get_connection_types,
+    connect_to_device,
+)
 from .util import UpperCaseChoice, YkmanContextObject
 from .info import info
 from .mode import mode
@@ -47,8 +51,8 @@ from .oath import oath
 from .piv import piv
 from .fido import fido
 from .config import config
-import usb.core
 import click
+import time
 import logging
 import sys
 
@@ -56,107 +60,129 @@ import sys
 logger = logging.getLogger(__name__)
 
 
-CLICK_CONTEXT_SETTINGS = dict(
-    help_option_names=['-h', '--help'],
-    max_content_width=999
-)
+CLICK_CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], max_content_width=999)
+
+
+def retrying_connect(serial, interfaces, attempts=10):
+    while True:
+        try:
+            return connect_to_device(serial, get_connection_types(interfaces))
+        except Exception as e:
+            if attempts:
+                attempts -= 1
+                logger.error("Failed opening connection, retry in 0.5s", exc_info=e)
+                time.sleep(0.5)
+            else:
+                raise
 
 
 def print_version(ctx, param, value):
     if not value or ctx.resilient_parsing:
         return
-    click.echo('YubiKey Manager (ykman) version: {}'.format(__version__))
-    libs = []
-    libs.append('libykpers ' + ('.'.join('%d' % d for d in ykpers_version)
-                                if ykpers_version is not None
-                                else 'not found!'))
-    usb_lib = get_usb_backend_version()
-    libs.append(usb_lib or '<pyusb backend missing>')
-    click.echo('Libraries:')
-    for lib in libs:
-        click.echo('    {}'.format(lib))
+    click.echo("YubiKey Manager (ykman) version: {}".format(__version__))
     ctx.exit()
 
 
-def _disabled_transport(ctx, transports, cmd_name):
-    req = ', '.join((t.name for t in TRANSPORT if t & transports))
-    click.echo("Command '{}' requires one of the following USB interfaces "
-               "to be enabled: '{}'.".format(cmd_name, req))
-    ctx.fail("Use 'ykman mode' to set the enabled USB interfaces.")
+def _disabled_interface(ctx, interfaces, cmd_name):
+    req = ", ".join((t.name for t in USB_INTERFACE if t & interfaces))
+    click.echo(
+        "Command '{}' requires one of the following USB interfaces "
+        "to be enabled: '{}'.".format(cmd_name, req)
+    )
+    ctx.fail("Use 'ykman config usb' to set the enabled USB interfaces.")
 
 
-def _run_cmd_for_serial(ctx, cmd, transports, serial):
+def _run_cmd_for_serial(ctx, cmd, interfaces, serial):
     try:
-        return open_device(transports, serial=serial)
-    except FailedOpeningDeviceException:
-        try:  # Retry, any transport
-            dev = open_device(serial=serial)
-            if not dev.mode.transports & transports:
-                if dev.config.usb_supported & transports:
-                    _disabled_transport(ctx, transports, cmd)
-                else:
-                    ctx.fail("Command '{}' is not supported by this device."
-                             .format(cmd))
-        except FailedOpeningDeviceException:
-            ctx.fail(
-                'Failed connecting to a YubiKey with serial: {}. '
-                'Make sure the application has the required '
-                'permissions.'.format(serial))
-
-
-def _run_cmd_for_single(ctx, cmd, transports, reader=None):
-    if reader:
-        if TRANSPORT.has(transports, TRANSPORT.CCID):
-            readers = list(open_ccid(reader))
-            if len(readers) == 1:
-                return YubiKey(Descriptor.from_driver(readers[0]), readers[0])
-            elif len(readers) > 1:
-                ctx.fail('Multiple YubiKeys on external readers detected.')
-            else:
-                ctx.fail('No YubiKey found on external reader.')
-        else:
-            ctx.fail('Not a CCID command.')
-    try:
-        descriptors = get_descriptors()
-    except usb.core.NoBackendError:
-        ctx.fail('No PyUSB backend detected!')
-    n_keys = len(descriptors)
-    if n_keys == 0:
-        ctx.fail('No YubiKey detected!')
-    if n_keys > 1:
-        ctx.fail('Multiple YubiKeys detected. Use --device SERIAL to specify '
-                 'which one to use.')
-    descriptor = descriptors[0]
-    if descriptor.mode.transports & transports:
+        return retrying_connect(serial, interfaces)
+    except ValueError:
         try:
-            return descriptor.open_device(transports)
-        except FailedOpeningDeviceException:
-            ctx.fail('Failed connecting to {} [{}]. '
-                     'Make sure the application has the '
-                     'required permissions.'
-                     .format(descriptor.name, descriptor.mode))
-    else:
-        _disabled_transport(ctx, transports, cmd)
+            # Serial not found, see if it's among other interfaces in USB enabled:
+            conn = retrying_connect(serial, sum(USB_INTERFACE) ^ interfaces)[0]
+            conn.close()
+            _disabled_interface(ctx, interfaces, cmd)
+        except ValueError:
+            ctx.fail(
+                "Failed connecting to a YubiKey with serial: {}. "
+                "Make sure the application has the required "
+                "permissions.".format(serial)
+            )
+
+
+def _run_cmd_for_single(ctx, cmd, interfaces, reader_name=None):
+    # Use a specific CCID reader
+    if reader_name:
+        if USB_INTERFACE.CCID in interfaces or cmd in (fido.name, otp.name):
+            readers = list_ccid(reader_name)
+            if len(readers) == 1:
+                dev = readers[0]
+                try:
+                    if cmd == fido.name:
+                        conn = dev.open_connection(FidoConnection)
+                    else:
+                        conn = dev.open_connection(SmartCardConnection)
+                    info = read_info(dev.pid, conn)
+                    return conn, dev.pid, info
+                except Exception as e:
+                    logger.error("Failure connecting to card", exc_info=e)
+                    ctx.fail("Failed to connect: {}".format(e))
+            elif len(readers) > 1:
+                ctx.fail("Multiple YubiKeys on external readers detected.")
+            else:
+                ctx.fail("No YubiKey found on external reader.")
+        else:
+            ctx.fail("Not a CCID command.")
+
+    # Find all connected devices
+    devices, _ = scan_devices()
+    n_devs = sum(devices.values())
+    if n_devs == 0:
+        ctx.fail("No YubiKey detected!")
+    if n_devs > 1:
+        ctx.fail(
+            "Multiple YubiKeys detected. Use --device SERIAL to specify "
+            "which one to use."
+        )
+
+    # Only one connected device, check if any needed interfaces are available
+    pid = next(iter(devices.keys()))
+    if pid.get_interfaces() & interfaces:
+        return retrying_connect(None, interfaces)
+    _disabled_interface(ctx, interfaces, cmd)
 
 
 @click.group(context_settings=CLICK_CONTEXT_SETTINGS)
-@click.option('-v', '--version', is_flag=True, callback=print_version,
-              expose_value=False, is_eager=True)
-@click.option('-d', '--device', type=int, metavar='SERIAL')
-@click.option('-l', '--log-level', default=None,
-              type=UpperCaseChoice(ykman.logging_setup.LOG_LEVEL_NAMES),
-              help='Enable logging at given verbosity level.',
-              )
-@click.option('--log-file', default=None,
-              type=str, metavar='FILE',
-              help='Write logs to the given FILE instead of standard error; '
-                   'ignored unless --log-level is also set.',
-              )
 @click.option(
-        '-r', '--reader',
-        help='Use an external smart card reader. Conflicts with --device and '
-             'list.',
-        metavar='NAME', default=None)
+    "-v",
+    "--version",
+    is_flag=True,
+    callback=print_version,
+    expose_value=False,
+    is_eager=True,
+)
+@click.option("-d", "--device", type=int, metavar="SERIAL")
+@click.option(
+    "-l",
+    "--log-level",
+    default=None,
+    type=UpperCaseChoice(ykman.logging_setup.LOG_LEVEL_NAMES),
+    help="Enable logging at given verbosity level.",
+)
+@click.option(
+    "--log-file",
+    default=None,
+    type=str,
+    metavar="FILE",
+    help="Write logs to the given FILE instead of standard error; "
+    "ignored unless --log-level is also set.",
+)
+@click.option(
+    "-r",
+    "--reader",
+    help="Use an external smart card reader. Conflicts with --device and " "list.",
+    metavar="NAME",
+    default=None,
+)
 @click.pass_context
 def cli(ctx, device, log_level, log_file, reader):
     """
@@ -178,88 +204,71 @@ def cli(ctx, device, log_level, log_file, reader):
         ykman.logging_setup.setup(log_level, log_file=log_file)
 
     if reader and device:
-        ctx.fail('--reader and --device options can\'t be combined.')
+        ctx.fail("--reader and --device options can't be combined.")
 
     subcmd = next(c for c in COMMANDS if c.name == ctx.invoked_subcommand)
     if subcmd == list_keys:
         if reader:
-            ctx.fail('--reader and list command can\'t be combined.')
+            ctx.fail("--reader and list command can't be combined.")
         return
 
-    transports = getattr(subcmd, 'transports', TRANSPORT.usb_transports())
-    if transports:
-        def resolve_device():
-            if device is not None:
-                dev = _run_cmd_for_serial(ctx, subcmd.name, transports, device)
-            else:
-                dev = _run_cmd_for_single(ctx, subcmd.name, transports, reader)
-            ctx.call_on_close(dev.close)
-            return dev
-        ctx.obj.add_resolver('dev', resolve_device)
+    interfaces = getattr(subcmd, "interfaces", USB_INTERFACE(sum(USB_INTERFACE)))
+    if interfaces:
+
+        def resolve():
+            if not getattr(resolve, "items", None):
+                if device is not None:
+                    resolve.items = _run_cmd_for_serial(
+                        ctx, subcmd.name, interfaces, device
+                    )
+                else:
+                    resolve.items = _run_cmd_for_single(
+                        ctx, subcmd.name, interfaces, reader
+                    )
+                ctx.call_on_close(resolve.items[0].close)
+            return resolve.items
+
+        ctx.obj.add_resolver("conn", lambda: resolve()[0])
+        ctx.obj.add_resolver("pid", lambda: resolve()[1])
+        ctx.obj.add_resolver("info", lambda: resolve()[2])
 
 
-@cli.command('list')
-@click.option('-s', '--serials', is_flag=True, help='Output only serial '
-              'numbers, one per line (devices without serial will be omitted).')
+@cli.command("list")
 @click.option(
-    '-r', '--readers', is_flag=True, help='List available smart card readers.')
+    "-s",
+    "--serials",
+    is_flag=True,
+    help="Output only serial "
+    "numbers, one per line (devices without serial will be omitted).",
+)
+@click.option(
+    "-r", "--readers", is_flag=True, help="List available smart card readers."
+)
 @click.pass_context
 def list_keys(ctx, serials, readers):
     """
     List connected YubiKeys.
     """
 
-    def _print_device(dev, serial):
-        if serials:
-            if serial:
-                click.echo(serial)
-        else:
-            click.echo('{} [{}]{}'.format(
-                dev.device_name,
-                dev.mode,
-                ' Serial: {}'.format(serial) if serial else '')
-            )
-
     if readers:
         for reader in list_readers():
             click.echo(reader.name)
         ctx.exit()
 
-    descriptors = get_descriptors()
-    handled_serials = set()
-
-    try:
-        for dev in list_devices():
-            if dev.key_type == YUBIKEY.SKY:
-                # We have nothing to match on, so just drop a SKY descriptor
-                d = next(x for x in descriptors if x.key_type == YUBIKEY.SKY)
-                descriptors.remove(d)
-                _print_device(dev, None)
-            else:
-                serial = dev.serial
-                if serial not in handled_serials:
-                    # Drop a descriptor with a matching serial and mode
-                    handled_serials.add(serial)
-                    matches = [d for d in descriptors if (d.key_type, d.mode)
-                               == (dev.driver.key_type, dev.driver.mode)]
-                    if len(matches) > 0:
-                        d = matches[0]
-                        descriptors.remove(d)
-                        _print_device(dev, serial)
-            dev.close()
-            if not descriptors:
-                break
-    except smartcard.pcsc.PCSCExceptions.EstablishContextException as e:
-        logger.error('Failed to list devices', exc_info=e)
-        ctx.fail(
-            'Failed to establish CCID context. Is the pcscd service running?')
-
-    # List descriptors that failed to open.
-    if len(descriptors) > 0:
-        logger.debug(
-            'Failed to open some devices, listing based on descriptors')
-    for desc in descriptors:
-        click.echo('{} [{}]'.format(desc.name, desc.mode))
+    # List all attached devices
+    for pid, dev_info in list_all_devices():
+        if serials:
+            if dev_info.serial:
+                click.echo(dev_info.serial)
+        else:
+            click.echo(
+                "{} ({}) [{}]{}".format(
+                    get_name(dev_info, pid.get_type()),
+                    "%d.%d.%d" % dev_info.version if dev_info.version else "unknown",
+                    pid.name.split("_", 1)[1].replace("_", "+"),
+                    " Serial: {}".format(dev_info.serial) if dev_info.serial else "",
+                )
+            )
 
 
 COMMANDS = (list_keys, info, mode, otp, openpgp, oath, piv, fido, config)
@@ -272,16 +281,22 @@ for cmd in COMMANDS:
 def main():
     try:
         cli(obj={})
-    except ValueError as e:
-        logger.error('Error', exc_info=e)
-        click.echo('Error: ' + str(e))
+    except ApplicationNotAvailableError as e:
+        logger.error("Error", exc_info=e)
+        click.echo(
+            "The functionality required for this command is not enabled or not "
+            "available on this YubiKey."
+        )
         return 1
-
+    except ValueError as e:
+        logger.error("Error", exc_info=e)
+        click.echo("Error: " + str(e))
+        return 1
     except Cve201715361VulnerableError as err:
-        logger.error('Error', exc_info=err)
-        click.echo('Error: ' + str(err))
+        logger.error("Error", exc_info=err)
+        click.echo("Error: " + str(err))
         return 2
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

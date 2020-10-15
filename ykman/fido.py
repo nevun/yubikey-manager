@@ -25,19 +25,31 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from __future__ import absolute_import
-
-import six
 import time
+import struct
 import logging
+from yubikit.core.fido import FidoConnection
+from fido2.hid import CTAPHID
 from fido2.ctap1 import CTAP1, ApduError
-from fido2.ctap2 import CTAP2, PinProtocolV1, CredentialManagement
+from fido2.ctap2 import CTAP2, ClientPin, CredentialManagement
 from threading import Timer
-from .driver_ccid import SW
-from .driver_fido import FIPS_U2F_CMD
+from enum import IntEnum, unique
 
 
 logger = logging.getLogger(__name__)
+
+SW_CONDITIONS_NOT_SATISFIED = 0x6985
+
+
+@unique
+class FIPS_U2F_CMD(IntEnum):
+    ECHO = CTAPHID.VENDOR_FIRST
+    WRITE_CONFIG = CTAPHID.VENDOR_FIRST + 1
+    APP_VERSION = CTAPHID.VENDOR_FIRST + 2
+    VERIFY_PIN = CTAPHID.VENDOR_FIRST + 3
+    SET_PIN = CTAPHID.VENDOR_FIRST + 4
+    RESET = CTAPHID.VENDOR_FIRST + 5
+    VERIFY_FIPS_MODE = CTAPHID.VENDOR_FIRST + 6
 
 
 class ResidentCredential(object):
@@ -51,24 +63,23 @@ class ResidentCredential(object):
 
     @property
     def rp_id(self):
-        return self._raw_rp[CredentialManagement.RESULT.RP]['id']
+        return self._raw_rp[CredentialManagement.RESULT.RP]["id"]
 
     @property
     def user_name(self):
-        return self._raw_credential[CredentialManagement.RESULT.USER]['name']
+        return self._raw_credential[CredentialManagement.RESULT.USER]["name"]
 
     @property
     def user_id(self):
-        return self._raw_credential[CredentialManagement.RESULT.USER]['id']
+        return self._raw_credential[CredentialManagement.RESULT.USER]["id"]
 
 
 class Fido2Controller(object):
-
-    def __init__(self, driver):
-        self.ctap = CTAP2(driver._dev)
-        self.pin = PinProtocolV1(self.ctap)
+    def __init__(self, ctap_device):
+        self.ctap = CTAP2(ctap_device)
+        self.pin = ClientPin(self.ctap)
         self._info = self.ctap.get_info()
-        self._pin = self._info.options['clientPin']
+        self._pin = self._info.options["clientPin"]
 
     @property
     def has_pin(self):
@@ -77,19 +88,22 @@ class Fido2Controller(object):
     def get_resident_credentials(self, pin):
         _credman = CredentialManagement(
             self.ctap,
-            self.pin.VERSION,
-            self.pin.get_pin_token(pin))
+            self.pin.protocol,
+            self.pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT),
+        )
 
         for rp in _credman.enumerate_rps():
             for cred in _credman.enumerate_creds(
-                    rp[CredentialManagement.RESULT.RP_ID_HASH]):
+                rp[CredentialManagement.RESULT.RP_ID_HASH]
+            ):
                 yield ResidentCredential(cred, rp)
 
     def delete_resident_credential(self, credential_id, pin):
         _credman = CredentialManagement(
             self.ctap,
-            self.pin.VERSION,
-            self.pin.get_pin_token(pin))
+            self.pin.protocol,
+            self.pin.get_pin_token(pin, ClientPin.PERMISSION.CREDENTIAL_MGMT),
+        )
 
         for cred in self.get_resident_credentials(pin):
             if credential_id == cred.credential_id:
@@ -106,14 +120,14 @@ class Fido2Controller(object):
         self.pin.change_pin(old_pin, new_pin)
 
     def reset(self, touch_callback=None):
-        if (touch_callback):
+        if touch_callback:
             touch_timer = Timer(0.500, touch_callback)
             touch_timer.start()
         try:
             self.ctap.reset()
             self._pin = False
         finally:
-            if (touch_callback):
+            if touch_callback:
                 touch_timer.cancel()
 
     @property
@@ -121,11 +135,18 @@ class Fido2Controller(object):
         return False
 
 
-class FipsU2fController(object):
+def is_in_fips_mode(fido_connection: FidoConnection) -> bool:
+    try:
+        ctap = CTAP1(fido_connection)
+        ctap.send_apdu(ins=FIPS_U2F_CMD.VERIFY_FIPS_MODE)
+        return True
+    except ApduError:
+        return False
 
-    def __init__(self, driver):
-        self.driver = driver
-        self.ctap = CTAP1(driver._dev)
+
+class FipsU2fController(object):
+    def __init__(self, ctap_device):
+        self.ctap = CTAP1(ctap_device)
 
     @property
     def has_pin(self):
@@ -133,25 +154,24 @@ class FipsU2fController(object):
         return True
 
     def set_pin(self, pin):
-        raise NotImplementedError('Use the change_pin method instead.')
+        raise NotImplementedError("Use the change_pin method instead.")
 
     def change_pin(self, old_pin, new_pin):
         new_length = len(new_pin)
 
-        old_pin = old_pin.encode('utf-8')
-        new_pin = new_pin.encode('utf-8')
+        old_pin = old_pin.encode()
+        new_pin = new_pin.encode()
 
-        data = six.int2byte(new_length) + old_pin + new_pin
+        data = struct.pack("B", new_length) + old_pin + new_pin
 
         self.ctap.send_apdu(ins=FIPS_U2F_CMD.SET_PIN, data=data)
         return True
 
     def verify_pin(self, pin):
-        self.ctap.send_apdu(
-            ins=FIPS_U2F_CMD.VERIFY_PIN, data=pin.encode('utf-8'))
+        self.ctap.send_apdu(ins=FIPS_U2F_CMD.VERIFY_PIN, data=pin.encode())
 
     def reset(self, touch_callback=None):
-        if (touch_callback):
+        if touch_callback:
             touch_timer = Timer(0.500, touch_callback)
             touch_timer.start()
 
@@ -162,13 +182,13 @@ class FipsU2fController(object):
                     self._pin = False
                     return True
                 except ApduError as e:
-                    if e.code == SW.CONDITIONS_NOT_SATISFIED:
+                    if e.code == SW_CONDITIONS_NOT_SATISFIED:
                         time.sleep(0.5)
                     else:
                         raise e
 
         finally:
-            if (touch_callback):
+            if touch_callback:
                 touch_timer.cancel()
 
     @property

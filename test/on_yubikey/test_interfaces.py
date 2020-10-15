@@ -1,23 +1,35 @@
 import unittest
 
 from .framework import DestructiveYubikeyTestCase, exactly_one_yubikey_present
-from ykman import driver_fido, driver_otp, driver_ccid
+from yubikit.core import USB_INTERFACE
+from ykman.device import connect_to_device, get_connection_types
+from time import sleep
 
 
-@unittest.skipIf(not exactly_one_yubikey_present(),
-                 'Exactly one YubiKey must be present.')
+@unittest.skipIf(
+    not exactly_one_yubikey_present(), "Exactly one YubiKey must be present."
+)
 class TestInterfaces(DestructiveYubikeyTestCase):
+    def try_connection(self, interface):
+        for _ in range(8):
+            try:
+                conn = connect_to_device(None, get_connection_types(interface))[0]
+                conn.close()
+                return
+            except Exception:
+                sleep(0.5)
+        self.fail("Failed connecting to device over " + interface.name)
 
     def test_switch_interfaces(self):
-        next(driver_fido.open_devices()).read_config()
-        next(driver_otp.open_devices()).read_config()
-        next(driver_fido.open_devices()).read_config()
-        next(driver_ccid.open_devices()).read_config()
-        next(driver_otp.open_devices()).read_config()
-        next(driver_ccid.open_devices()).read_config()
-        next(driver_otp.open_devices()).read_config()
-        next(driver_fido.open_devices()).read_config()
-        next(driver_ccid.open_devices()).read_config()
-        next(driver_fido.open_devices()).read_config()
-        next(driver_ccid.open_devices()).read_config()
-        next(driver_otp.open_devices()).read_config()
+        self.try_connection(USB_INTERFACE.FIDO)
+        self.try_connection(USB_INTERFACE.OTP)
+        self.try_connection(USB_INTERFACE.FIDO)
+        self.try_connection(USB_INTERFACE.CCID)
+        self.try_connection(USB_INTERFACE.OTP)
+        self.try_connection(USB_INTERFACE.CCID)
+        self.try_connection(USB_INTERFACE.OTP)
+        self.try_connection(USB_INTERFACE.FIDO)
+        self.try_connection(USB_INTERFACE.CCID)
+        self.try_connection(USB_INTERFACE.FIDO)
+        self.try_connection(USB_INTERFACE.CCID)
+        self.try_connection(USB_INTERFACE.OTP)

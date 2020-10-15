@@ -1,4 +1,4 @@
-# Copyright (c) 2013 Yubico AB
+# Copyright (c) 2020 Yubico AB
 # All rights reserved.
 #
 #   Redistribution and use in source and binary forms, with or
@@ -25,48 +25,43 @@
 # ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-from .libloader import load_library
-import os
+from .base import OtpYubiKeyDevice
+from yubikit.core import YubiKeyDevice, PID, TRANSPORT
+from fido2.hid import list_descriptors, open_connection, CtapHidDevice
+from typing import List, Callable
 import sys
 
 
-def use_library(libname, version=None, extra_paths=[]):
-    lib = load_library(libname, version, extra_paths)
-
-    def define(func_name, argtypes, restype=None):
-        try:
-            f = getattr(lib, func_name)
-            f.argtypes = argtypes
-            f.restype = restype
-        except AttributeError:
-            print('Undefined symbol: %s' % func_name)
-
-            def error(*args, **kwargs):
-                raise Exception('Undefined symbol: %s' % func_name)
-            f = error
-        return f
-    return define
+if sys.platform.startswith("linux"):
+    from . import linux as backend
+elif sys.platform.startswith("win32"):
+    from . import windows as backend
+elif sys.platform.startswith("darwin"):
+    from . import macos as backend
+else:
+    raise Exception("Unsupported platform")
 
 
-class CLibrary(object):
-    """
-    Base class for extending to create python wrappers for c libraries.
+list_otp_devices: Callable[[], List[OtpYubiKeyDevice]] = backend.list_devices
 
-    Example:
-        class Foo(CLibrary):
-            foo_func = [c_bool, c_char_p], int
 
-        foo = Foo('libfoo')
+class CtapYubiKeyDevice(YubiKeyDevice):
+    """YubiKey FIDO USB HID device"""
 
-        assert foo.foo_func(True, 'Hello!') == 7
-    """
-    def __init__(self, libname, version=None):
-        module_path = sys.modules[self.__class__.__module__].__file__
-        extra_paths = [os.path.dirname(module_path)]
-        self._lib = use_library(libname, version, extra_paths)
+    def __init__(self, descriptor):
+        super(CtapYubiKeyDevice, self).__init__(
+            TRANSPORT.USB, descriptor.path, PID(descriptor.pid)
+        )
+        self.descriptor = descriptor
 
-    def __getattribute__(self, name):
-        val = object.__getattribute__(self, name)
-        if isinstance(val, tuple) and len(val) == 2:
-            return self._lib(name, *val)
-        return val
+    def supports_connection(self, connection_type):
+        return issubclass(CtapHidDevice, connection_type)
+
+    def open_connection(self, connection_type):
+        if self.supports_connection(connection_type):
+            return CtapHidDevice(self.descriptor, open_connection(self.descriptor))
+        return super(OtpYubiKeyDevice, self).open_connection(connection_type)
+
+
+def list_ctap_devices() -> List[CtapYubiKeyDevice]:
+    return [CtapYubiKeyDevice(d) for d in list_descriptors()]
